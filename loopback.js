@@ -36,13 +36,8 @@ let interval;
 
 async function start() {
   startButton.disabled = true;
-  navigator.mediaDevices.getUserMedia({
-    audio: { sampleRate: 16000 },
-    video: false
-  }).then((stream) => {
-    callButton.disabled = false;
-    localStream = stream;
-  });
+  localStream = await navigator.mediaDevices.getUserMedia({audio: true});
+  callButton.disabled = false;
 }
 
 async function call() {
@@ -57,8 +52,8 @@ async function call() {
   lastBytesSent = null;
 
   const useLyra = codecSelect.value === "lyra";
-  pc1 = new RTCPeerConnection({ encodedInsertableStreams: useLyra });
-  pc2 = new RTCPeerConnection({ encodedInsertableStreams: useLyra });
+  pc1 = new RTCPeerConnection({ encodedInsertableStreams: true, bundlePolicy: 'max-bundle'});
+  pc2 = new RTCPeerConnection({ encodedInsertableStreams: true});
   pc1.onicecandidate = (e) => {
     pc2.addIceCandidate(e.candidate)
   };
@@ -73,7 +68,7 @@ async function call() {
       const receiver = e.receiver;
       const receiverStreams = receiver.createEncodedStreams();
       const transformStream = new TransformStream({
-        transform: decodeFunction,
+        transform: receiveRedundancy,
       });
       receiverStreams.readable
           .pipeThrough(transformStream)
@@ -81,39 +76,44 @@ async function call() {
     }
     audioOutput.srcObject = e.streams[0];
   };
-  localStream.getTracks().forEach(track => pc1.addTrack(track, localStream));
-  if (useLyra) {
-    const sender = pc1.getSenders()[0];
-    const senderStreams = sender.createEncodedStreams();
-    const transformStream = new TransformStream({
-      transform: encodeFunction,
-    });
-    senderStreams.readable
-        .pipeThrough(transformStream)
-        .pipeTo(senderStreams.writable);
-  } else if (codecSelect.value !== "pcm") {
-    const preferredCodecMimeType = codecSelect.value === "opus" ? "audio/opus" : "audio/PCMA";
-    const { codecs } = RTCRtpSender.getCapabilities('audio');
-    const preferredCodecIndex = codecs.findIndex(c => c.mimeType === preferredCodecMimeType);
-    const preferredCodec = codecs[preferredCodecIndex];
-    codecs.splice(preferredCodecIndex, 1);
-    codecs.unshift(preferredCodec);
-    const transceiver = pc1.getTransceivers().find(t => t.sender && t.sender.track === localStream.getAudioTracks()[0]);
-    transceiver.setCodecPreferences(codecs);
-  }
-  pc1.createOffer().then((offer) => {
-   const modifiedOffer = modifyDesc(offer);
-    pc1.setLocalDescription(modifiedOffer).then(() => {
-      return pc2.setRemoteDescription(modifiedOffer);
-    }).then(() => {
-     return pc2.createAnswer();
-    }).then((answer) => {
-      const modifiedAnswer = modifyDesc(answer);
-      pc2.setLocalDescription(modifiedAnswer).then(() => {
-        pc1.setRemoteDescription(modifiedAnswer);
-      });
-    });
-  });
+  const opus = pc1.addTransceiver(localStream.getTracks()[0], localStream).sender;
+  const opusStream = opus.createEncodedStreams();
+  opusStream.readable
+    .pipeThrough(new TransformStream({
+      transform: addRedundancyToOpus,
+    }))
+    .pipeTo(opusStream.writable);
+  const l16  = pc1.addTransceiver(localStream.getTracks()[0], localStream).sender;
+  const l16Stream = l16.createEncodedStreams();
+  l16Stream.readable
+    .pipeThrough(new TransformStream({
+      transform: grabL16Packet,
+    }))
+    .pipeTo(l16Stream.writable);
+
+  const offer = await pc1.createOffer();
+  let sections = SDPUtils.splitSections(offer.sdp);
+  offer.sdp = sections[0] + sections[1] + 
+    sections[2].replace('AVPF 111 ', 'AVPF 111 109 ') + 
+    'a=rtpmap:109 L16/16000/1\r\n';
+  await pc1.setLocalDescription(offer);
+  
+  const modifiedOffer = sections[0].replace('BUNDLE 0 1', 'BUNDLE 0')
+    + sections[1].replace('AVPF 111 ', 'AVPF 111 109 ');
+  await pc2.setRemoteDescription({type: 'offer', sdp: modifiedOffer});  
+  
+  const answer = await pc2.createAnswer();
+  answer.sdp = answer.sdp.replace('AVPF 111 ', 'AVPF 109 111 ') + 
+    'a=rtpmap:109 L16/16000/1\r\n';
+  await pc2.setLocalDescription(answer);
+  
+  sections = SDPUtils.splitSections(answer.sdp);
+  const modifiedAnswer = sections[0].replace('BUNDLE 0', 'BUNDLE 0 1') +
+  	sections[1].replace('AVPF 109 111 63 ', 'AVPF 63 111 ') +
+    sections[1]
+      .replace('a=mid:0\r\n', 'a=mid:1\r\n') +
+    	'a=fmtp:109 ptime=20\r\n';
+  await pc1.setRemoteDescription({type: 'answer', sdp: modifiedAnswer});
   interval = setInterval(updateStat, 1000);
 }
 
@@ -150,34 +150,6 @@ function appendTD(tr, text) {
   tr.appendChild(td);
 }
 
-function modifyDesc(desc) {
-  let modifiedSDP = desc.sdp;
-  if (codecSelect.value === "lyra" || codecSelect.value === "pcm") {
-    modifiedSDP = addL16ToSDP(modifiedSDP);
-  }
-  if (codecSelect.value === "lyra") {
-    modifiedSDP = removeCNFromSDP(modifiedSDP);
-  }
-  return {
-    type: desc.type,
-    sdp: modifiedSDP
-  }
-}
-
-function addL16ToSDP(sdp) {
-  return sdp
-     .replace("SAVPF 111", "SAVPF 109 111")
-     .replace("a=rtpmap:111", "a=rtpmap:109 L16/16000/1\r\na=fmtp:109 ptime=20\r\na=rtpmap:111");
-}
-
-function removeCNFromSDP(sdp) {
-  return sdp
-     .replace("a=rtpmap:106 CN/32000\r\n", "")
-     .replace("a=rtpmap:105 CN/16000\r\n", "")
-     .replace("a=rtpmap:13 CN/8000\r\n", "")
-     .replace(" 106 105 13", "");
-}
-
 function encodeFunction(encodedFrame, controller) {
   const inputDataArray = new Uint8Array(encodedFrame.data);
 
@@ -202,6 +174,83 @@ function encodeFunction(encodedFrame, controller) {
   controller.enqueue(encodedFrame);
 }
 
+const l16Buffer = []; // TODO: prefill with [undefined] to shift 1 frame?
+const MAX_TIMESTAMP = 0x100000000;
+const payloadType = 63;
+
+function addRedundancyToOpus(encodedFrame, controller) {
+  const red = l16Buffer.shift();
+  if (red) {
+    //Encode L16 using Lyra.
+    const inputDataArray = new Uint8Array(red.data);
+
+    const inputBufferPtr = codecModule._malloc(red.data.byteLength);
+    const encodedBufferPtr = codecModule._malloc(1024);
+
+    codecModule.HEAPU8.set(inputDataArray, inputBufferPtr);
+    const length = codecModule.encode(inputBufferPtr,
+        inputDataArray.length, 16000,
+        encodedBufferPtr);
+
+    const newData = new ArrayBuffer(length);
+    if (length > 0) {
+      const newDataArray = new Uint8Array(newData);
+      newDataArray.set(codecModule.HEAPU8.subarray(encodedBufferPtr, encodedBufferPtr + length));
+    }
+
+    codecModule._free(inputBufferPtr);
+    codecModule._free(encodedBufferPtr);
+    red.data = newData;
+  }
+  const allFrames = [red].filter(frame => !!frame).concat({
+    timestamp: encodedFrame.timestamp,
+    data: encodedFrame.data,
+  });
+
+  let needLength = 1 + encodedFrame.data.byteLength;
+  for (let i = allFrames.length - 2; i >= 0; i--) {
+     const frame = allFrames[i];
+     needLength += 4 + frame.data.byteLength;
+  }
+  const newData = new Uint8Array(needLength);
+  const newView = new DataView(newData.buffer);
+  
+  // Construct the header.
+  let frameOffset = 0;
+  //console.log('needLength', needLength);
+  for (let i = 0; i < allFrames.length - 1; i++) {
+    const frame = allFrames[i];
+    // TODO: check this for wraparound
+    const tsOffset = (encodedFrame.timestamp - frame.timestamp + MAX_TIMESTAMP) % MAX_TIMESTAMP; // Ensure correct behaviour on wraparound.
+    newView.setUint8(frameOffset, 109 | 0x80);
+    newView.setUint16(frameOffset + 1, (tsOffset << 2) ^ (frame.data.byteLength >> 8));
+    newView.setUint8(frameOffset + 3, frame.data.byteLength & 0xff);
+    frameOffset += 4;
+  }
+  // Last block header.
+  newView.setUint8(frameOffset++, 111);
+
+  // Construct the frame.
+  for (let i = 0; i < allFrames.length; i++) {
+     const frame = allFrames[i];
+     newData.set(new Uint8Array(frame.data), frameOffset);
+     frameOffset += frame.data.byteLength;
+  }
+  encodedFrame.data = newData.buffer;
+  controller.enqueue(encodedFrame);  
+}
+
+function grabL16Packet(encodedFrame, controller) {
+  l16Buffer.push({
+    timestamp: encodedFrame.timestamp,
+    data: new Uint8Array(encodedFrame.data).slice(0).buffer,
+  });
+  // clear and enqueue with 0 length.
+  encodedFrame.data = (new Uint8Array(0)).buffer;
+  controller.enqueue(encodedFrame);
+}
+
+
 function decodeFunction(encodedFrame, controller) {
   const newData = new ArrayBuffer(16000 * 0.02 * 2);
   if (encodedFrame.data.byteLength > 0) {
@@ -222,6 +271,86 @@ function decodeFunction(encodedFrame, controller) {
 
   encodedFrame.data = newData;
   controller.enqueue(encodedFrame);
+}
+
+let dump = 3;
+function receiveRedundancy(encodedFrame, controller) {
+  if (encodedFrame.data.byteLength === 0) {
+    controller.enqueue(encodedFrame);
+    return;
+  }
+
+  // Decode RED.
+  const view = new DataView(encodedFrame.data);
+  const data = new Uint8Array(encodedFrame.data);
+  let headerLength = 0;
+  let totalLength = 0;
+  let redundancy = 0;
+  let lengths = [];
+  let payloadTypes = [];
+  let timestamps = [];
+  while (headerLength < encodedFrame.data.byteLength) {
+    const nextBlock = view.getUint8(headerLength) & 0x80;
+    if (!nextBlock) {
+      payloadTypes.push(view.getUint8(headerLength));
+      headerLength += 1;
+      break;
+    }
+    redundancy++;
+    const blockPayloadType = view.getUint8(headerLength) & 0x7f;
+    payloadTypes.push(blockPayloadType);
+    const tsOffset = view.getUint16(headerLength + 1) >> 2;
+    timestamps.push((encodedFrame.timestamp - tsOffset + MAX_TIMESTAMP) % MAX_TIMESTAMP);
+    const length = view.getUint16(headerLength + 2) & 0x3ff;
+    lengths.push(length);
+    totalLength += length;
+    headerLength += 4;
+  }
+  if (headerLength + totalLength > encodedFrame.data.byteLength) { // Not RED.
+    return controller.enqueue(encodedFrame);
+  }
+  const frames = [];
+  let frameOffset = headerLength;
+  while(lengths.length) {
+    const length = lengths.shift();
+    const frame = data.slice(frameOffset, frameOffset + length);
+    frames.push(frame);
+    frameOffset += length;
+  }
+  const newFrame = data.slice(frameOffset);
+  frames.push(newFrame);
+  timestamps.push(encodedFrame.timestamp);
+  
+  // Decode Lyra to L16.
+  frames.forEach((frame, index) => {
+    const blockPayloadType = payloadTypes[index];
+    if (blockPayloadType !== 109) {
+      return;
+    }
+    if (frame.byteLength === 0) {
+      return;
+    }
+    const newData = new ArrayBuffer(16000 * 0.02 * 2);
+    const inputDataArray = new Uint8Array(frame);
+    const inputBufferPtr = codecModule._malloc(frame.byteLength);
+    const outputBufferPtr = codecModule._malloc(2048);
+    codecModule.HEAPU8.set(inputDataArray, inputBufferPtr);
+    const length = codecModule.decode(inputBufferPtr,
+                                      inputDataArray.length, 16000,
+                                      outputBufferPtr);
+
+    const newDataArray = new Uint8Array(newData);
+    newDataArray.set(codecModule.HEAPU8.subarray(outputBufferPtr, outputBufferPtr + length));
+
+    codecModule._free(inputBufferPtr);
+    codecModule._free(outputBufferPtr);
+    frames[index] = newDataArray;
+  });
+  // Re-encode RED.
+  if (dump > 0) {
+      dump--;
+      console.log(frames, payloadTypes, timestamps);
+  }
 }
 
 function updateStat() {
