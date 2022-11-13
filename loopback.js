@@ -40,6 +40,25 @@ async function start() {
   callButton.disabled = false;
 }
 
+function swapPayloadTypes(sdp, payloadType1, payloadType2) {
+  return sdp
+	// Swap first payload type with 255
+	.replace('a=rtpmap:' + payloadType1 + ' ', 'a=rtpmap:255 ')
+	.replace('a=rtcp-fb:' + payloadType1 + ' ', 'a=rtcp-fb:255 ')
+	.replace('a=fmtp:' + payloadType1 + ' ' + payloadType2 + '/' + payloadType2, 'a=fmtp:255 255/255')
+    .replace('a=fmtp:' + payloadType1 + ' minptime=10;useinbandfec=', 'a=fmtp:255 minptime=10;useinbandfec=')
+	// swawp second payload type with first payload type
+	.replace('a=rtpmap:' + payloadType2 + ' ', 'a=rtpmap:' + payloadType1 + ' ')
+	.replace('a=rtcp-fb:' + payloadType2 + ' ', 'a=rtcp-fb:' + payloadType1 + ' ')
+	.replace('a=fmtp:' + payloadType2 + ' ' + payloadType1 + '/' + payloadType1, 'a=fmtp:' + payloadType1 + ' ' + payloadType2 + '/' + payloadType2)
+    .replace('a=fmtp:' + payloadType2 + ' minptime=10;useinbandfec=', 'a=fmtp:' + payloadType1 + ' minptime=10;useinbandfec=')
+	// swap 255 with second payload type
+	.replace('a=rtpmap:255 ', 'a=rtpmap:' + payloadType2 + ' ')
+	.replace('a=rtcp-fb:255 ', 'a=rtcp-fb:' + payloadType2 + ' ')
+	.replace('a=fmtp:255 255/255', 'a=fmtp:' + payloadType2 + ' ' + payloadType1 + '/' + payloadType1)
+    .replace('a=fmtp:255 minptime=10;useinbandfec=', 'a=fmtp:' + payloadType2 + ' minptime=10;useinbandfec=');
+}
+
 async function call() {
   codecSelect.disabled = true;
   callButton.disabled = true;
@@ -76,14 +95,14 @@ async function call() {
     }
     audioOutput.srcObject = e.streams[0];
   };
-  const opus = pc1.addTransceiver(localStream.getTracks()[0], localStream).sender;
+  const opus = pc1.addTransceiver(localStream.getTracks()[0], {streams: [localStream]}).sender;
   const opusStream = opus.createEncodedStreams();
   opusStream.readable
     .pipeThrough(new TransformStream({
       transform: addRedundancyToOpus,
     }))
     .pipeTo(opusStream.writable);
-  const l16  = pc1.addTransceiver(localStream.getTracks()[0], localStream).sender;
+  const l16  = pc1.addTransceiver(localStream.getTracks()[0], {streams: [localStream]}).sender;
   const l16Stream = l16.createEncodedStreams();
   l16Stream.readable
     .pipeThrough(new TransformStream({
@@ -99,21 +118,29 @@ async function call() {
   await pc1.setLocalDescription(offer);
   
   const modifiedOffer = sections[0].replace('BUNDLE 0 1', 'BUNDLE 0')
-    + sections[1].replace('AVPF 111 ', 'AVPF 111 109 ');
+    + swapPayloadTypes(
+                       sections[1]
+                          .replace('AVPF 111 ', 'AVPF 111 109 ')
+                          .replace('useinbandfec=1', 'useinbandfec=0')
+          , 111, 63);
   await pc2.setRemoteDescription({type: 'offer', sdp: modifiedOffer});  
   
   const answer = await pc2.createAnswer();
-  answer.sdp = answer.sdp.replace('AVPF 111 ', 'AVPF 109 111 ') + 
+  answer.sdp = answer.sdp
+      .replace('AVPF 111 ', 'AVPF 109 111 ') 
+      .replace('useinbandfec=1', 'useinbandfec=0') +
     'a=rtpmap:109 L16/16000/1\r\n';
   await pc2.setLocalDescription(answer);
   
   sections = SDPUtils.splitSections(answer.sdp);
   const modifiedAnswer = sections[0].replace('BUNDLE 0', 'BUNDLE 0 1') +
-    // This is a bit complicated. We want PT 63 to be sent.
-  	sections[1].replace('AVPF 109 111 63 ', 'AVPF 63 111 ') +
-    sections[1]
+    // This is a bit complicated. We want PT 111 to be sent so we get raw opus
+    swapPayloadTypes(
+					 sections[1].replace('AVPF 109 111 63', 'AVPF 111 63'), 63, 111) +
+	sections[1]
       .replace('a=mid:0\r\n', 'a=mid:1\r\n') +
-    	'a=fmtp:109 ptime=20\r\n';
+      'a=fmtp:109 ptime=20\r\n';
+				
   await pc1.setRemoteDescription({type: 'answer', sdp: modifiedAnswer});
   interval = setInterval(updateStat, 1000);
 }
@@ -177,10 +204,9 @@ function encodeFunction(encodedFrame, controller) {
 
 const l16Buffer = []; // TODO: prefill with [undefined] to shift 1 frame?
 const MAX_TIMESTAMP = 0x100000000;
-const payloadType = 63;
 
 function addRedundancyToOpus(encodedFrame, controller) {
-  const red = l16Buffer.shift();
+  const red = undefined; //l16Buffer.shift();
   if (red) {
     //Encode L16 using Lyra.
     const inputDataArray = new Uint8Array(red.data);
@@ -204,15 +230,7 @@ function addRedundancyToOpus(encodedFrame, controller) {
     red.data = newData;
     red.timestamp = (encodedFrame.timestamp - 960 + MAX_TIMESTAMP) % MAX_TIMESTAMP
   }
-  // TODO: to make life simpler (or less confusing) we use the native RED encoder.
-  // remove the redundant frame from that.
-  const nativeRed = new Uint8Array(encodedFrame.data);
-  let offset = 1;
-  if (nativeRed[0] & 0x80) {
-    offset = 1 + 2 + ((nativeRed[2] & 0b11) << 8) + nativeRed[3];
-  }
-  encodedFrame.data = encodedFrame.data.slice(offset);
-  if (dump > 0) console.log('E', new Uint8Array(encodedFrame.data));
+
   const allFrames = [red].filter(frame => !!frame).concat({
     timestamp: encodedFrame.timestamp,
     data: encodedFrame.data,
@@ -238,7 +256,7 @@ function addRedundancyToOpus(encodedFrame, controller) {
     frameOffset += 4;
   }
   // Last block header.
-  newView.setUint8(frameOffset++, 111);
+  newView.setUint8(frameOffset++, 63);
 
   // Construct the frame.
   for (let i = 0; i < allFrames.length; i++) {
@@ -364,7 +382,7 @@ function receiveRedundancy(encodedFrame, controller) {
   for (let i = frames.length - 2; i >= 0; i--) {
     const frame = frames[i];
     if (frame.frameLength === 0) continue;
-    if (payloadTypes[i] !== 111) continue;
+    if (payloadTypes[i] !== 63) continue;
     needLength += 4 + frame.byteLength;
   }
   const newData = new Uint8Array(needLength);
@@ -375,7 +393,7 @@ function receiveRedundancy(encodedFrame, controller) {
   for (let i = 0; i < frames.length - 1; i++) {
     const frame = frames[i];
     if (frame.frameLength === 0) continue;
-    if (payloadTypes[i] !== 111) continue;
+    if (payloadTypes[i] !== 63) continue;
     const tsOffset = timestamps[i];
     newView.setUint8(frameOffset, payloadTypes[i] | 0x80);
     newView.setUint16(frameOffset + 1, (tsOffset << 2) ^ (frame.byteLength >> 8));
@@ -389,14 +407,14 @@ function receiveRedundancy(encodedFrame, controller) {
   for (let i = 0; i < frames.length; i++) {
     const frame = frames[i];
     if (frame.frameLength === 0) continue;
-    if (payloadTypes[i] !== 111) continue;
+    if (payloadTypes[i] !== 63) continue;
     newData.set(new Uint8Array(frame), frameOffset);
     frameOffset += frame.byteLength;
   }
   if (dump > 0) {
     dump--;
     console.log('F', frames, payloadTypes, timestamps, encodedFrame.getMetadata());
-    //console.log('O', new Uint8Array(encodedFrame.data));
+    console.log('O', new Uint8Array(encodedFrame.data));
     console.log('N', newData);
   }
   encodedFrame.data = newData.buffer;
