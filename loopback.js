@@ -206,7 +206,7 @@ const l16Buffer = []; // TODO: prefill with [undefined] to shift 1 frame?
 const MAX_TIMESTAMP = 0x100000000;
 
 function addRedundancyToOpus(encodedFrame, controller) {
-  const red = undefined; //l16Buffer.shift();
+  const red = l16Buffer.shift();
   if (red) {
     //Encode L16 using Lyra.
     const inputDataArray = new Uint8Array(red.data);
@@ -301,7 +301,6 @@ function decodeFunction(encodedFrame, controller) {
   controller.enqueue(encodedFrame);
 }
 
-let dump = 3;
 function receiveRedundancy(encodedFrame, controller) {
   if (encodedFrame.data.byteLength === 0) {
     controller.enqueue(encodedFrame);
@@ -410,12 +409,6 @@ function receiveRedundancy(encodedFrame, controller) {
     if (payloadTypes[i] !== 63) continue;
     newData.set(new Uint8Array(frame), frameOffset);
     frameOffset += frame.byteLength;
-  }
-  if (dump > 0) {
-    dump--;
-    console.log('F', frames, payloadTypes, timestamps, encodedFrame.getMetadata());
-    console.log('O', new Uint8Array(encodedFrame.data));
-    console.log('N', newData);
   }
   encodedFrame.data = newData.buffer;
   controller.enqueue(encodedFrame);
