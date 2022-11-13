@@ -53,7 +53,7 @@ async function call() {
 
   const useLyra = codecSelect.value === "lyra";
   pc1 = new RTCPeerConnection({ encodedInsertableStreams: true, bundlePolicy: 'max-bundle'});
-  pc2 = new RTCPeerConnection({ encodedInsertableStreams: true});
+  pc2 = new RTCPeerConnection({ encodedInsertableStreams: true });
   pc1.onicecandidate = (e) => {
     pc2.addIceCandidate(e.candidate)
   };
@@ -109,6 +109,7 @@ async function call() {
   
   sections = SDPUtils.splitSections(answer.sdp);
   const modifiedAnswer = sections[0].replace('BUNDLE 0', 'BUNDLE 0 1') +
+    // This is a bit complicated. We want PT 63 to be sent.
   	sections[1].replace('AVPF 109 111 63 ', 'AVPF 63 111 ') +
     sections[1]
       .replace('a=mid:0\r\n', 'a=mid:1\r\n') +
@@ -201,7 +202,17 @@ function addRedundancyToOpus(encodedFrame, controller) {
     codecModule._free(inputBufferPtr);
     codecModule._free(encodedBufferPtr);
     red.data = newData;
+    red.timestamp = (encodedFrame.timestamp - 960 + MAX_TIMESTAMP) % MAX_TIMESTAMP
   }
+  // TODO: to make life simpler (or less confusing) we use the native RED encoder.
+  // remove the redundant frame from that.
+  const nativeRed = new Uint8Array(encodedFrame.data);
+  let offset = 1;
+  if (nativeRed[0] & 0x80) {
+    offset = 1 + 2 + ((nativeRed[2] & 0b11) << 8) + nativeRed[3];
+  }
+  encodedFrame.data = encodedFrame.data.slice(offset);
+  if (dump > 0) console.log('E', new Uint8Array(encodedFrame.data));
   const allFrames = [red].filter(frame => !!frame).concat({
     timestamp: encodedFrame.timestamp,
     data: encodedFrame.data,
@@ -217,7 +228,6 @@ function addRedundancyToOpus(encodedFrame, controller) {
   
   // Construct the header.
   let frameOffset = 0;
-  //console.log('needLength', needLength);
   for (let i = 0; i < allFrames.length - 1; i++) {
     const frame = allFrames[i];
     // TODO: check this for wraparound
@@ -300,7 +310,7 @@ function receiveRedundancy(encodedFrame, controller) {
     const blockPayloadType = view.getUint8(headerLength) & 0x7f;
     payloadTypes.push(blockPayloadType);
     const tsOffset = view.getUint16(headerLength + 1) >> 2;
-    timestamps.push((encodedFrame.timestamp - tsOffset + MAX_TIMESTAMP) % MAX_TIMESTAMP);
+    timestamps.push(tsOffset);
     const length = view.getUint16(headerLength + 2) & 0x3ff;
     lengths.push(length);
     totalLength += length;
@@ -309,7 +319,7 @@ function receiveRedundancy(encodedFrame, controller) {
   if (headerLength + totalLength > encodedFrame.data.byteLength) { // Not RED.
     return controller.enqueue(encodedFrame);
   }
-  const frames = [];
+  let frames = [];
   let frameOffset = headerLength;
   while(lengths.length) {
     const length = lengths.shift();
@@ -346,11 +356,51 @@ function receiveRedundancy(encodedFrame, controller) {
     codecModule._free(outputBufferPtr);
     frames[index] = newDataArray;
   });
+
+  // There is a catch here. RED in Chrome will drop non-primary.
+  // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/audio_coding/neteq/red_payload_splitter.cc;l=160;drc=5a691c7c1c46421b2fa7ff3cd3b5f79470ed3808;bpv=1;bpt=1
   // Re-encode RED.
-  if (dump > 0) {
-      dump--;
-      console.log(frames, payloadTypes, timestamps);
+  let needLength = 1 + frames[frames.length - 1].byteLength;
+  for (let i = frames.length - 2; i >= 0; i--) {
+    const frame = frames[i];
+    if (frame.frameLength === 0) continue;
+    if (payloadTypes[i] !== 111) continue;
+    needLength += 4 + frame.byteLength;
   }
+  const newData = new Uint8Array(needLength);
+  const newView = new DataView(newData.buffer);
+
+  // Construct the header.
+  frameOffset = 0;
+  for (let i = 0; i < frames.length - 1; i++) {
+    const frame = frames[i];
+    if (frame.frameLength === 0) continue;
+    if (payloadTypes[i] !== 111) continue;
+    const tsOffset = timestamps[i];
+    newView.setUint8(frameOffset, payloadTypes[i] | 0x80);
+    newView.setUint16(frameOffset + 1, (tsOffset << 2) ^ (frame.byteLength >> 8));
+    newView.setUint8(frameOffset + 3, frame.byteLength & 0xff);
+    frameOffset += 4;
+  }
+  // Last block header.
+  newView.setUint8(frameOffset++, payloadTypes[frames.length - 1]);
+
+  // Construct the frame.
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i];
+    if (frame.frameLength === 0) continue;
+    if (payloadTypes[i] !== 111) continue;
+    newData.set(new Uint8Array(frame), frameOffset);
+    frameOffset += frame.byteLength;
+  }
+  if (dump > 0) {
+    dump--;
+    console.log('F', frames, payloadTypes, timestamps, encodedFrame.getMetadata());
+    //console.log('O', new Uint8Array(encodedFrame.data));
+    console.log('N', newData);
+  }
+  encodedFrame.data = newData.buffer;
+  controller.enqueue(encodedFrame);
 }
 
 function updateStat() {
