@@ -30,13 +30,24 @@
       <label for="codecSelect"> Codec:</label>
       <select id="codecSelect">
         <option value="lyra">Lyra - 16ksps</option>
-        <option value="pcm">PCM - 16ksps,16bit</option>
-        <option value="opus">Opus - 48ksps,2ch</option>
-        <option value="g711">PCMA - 8ksps,8bit</option>
       </select>
       <button type="button" id="callButton" disabled>Call</button>
       <button type="button" id="hangupButton" disabled>Hang Up</button>
-      <span id="bitrateSpan"></span>
+      <label>Bandwidth:</label>
+      <select id="bandwidth" disabled>
+          <option value="unlimited" selected>unlimited</option>
+          <option value="16000">16kbps</option>
+          <option value="10000">10kbps</option>
+          <option value="8000">8kbps</option>
+          <option value="6000">6kbps</option>
+      </select>
+      <div>
+        <span id="configuration"></span>
+        <span id="bitrateSpan"></span>
+      </div>
+      <div>
+        <span id="codec"></span>
+      </div>
     </div>
     <div>
       <audio id="audioOutput" controls autoplay></audio>
