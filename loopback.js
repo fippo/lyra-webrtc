@@ -377,40 +377,49 @@ function receiveRedundancy(encodedFrame, controller) {
   // There is a catch here. RED in Chrome will drop non-primary.
   // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/audio_coding/neteq/red_payload_splitter.cc;l=160;drc=5a691c7c1c46421b2fa7ff3cd3b5f79470ed3808;bpv=1;bpt=1
   // Re-encode RED.
-  let needLength = 1 + frames[frames.length - 1].byteLength;
-  for (let i = frames.length - 2; i >= 0; i--) {
-    const frame = frames[i];
-    if (frame.frameLength === 0) continue;
-    if (payloadTypes[i] !== 63) continue;
-    needLength += 4 + frame.byteLength;
-  }
-  const newData = new Uint8Array(needLength);
-  const newView = new DataView(newData.buffer);
+  if (0) {
+    let needLength = 1 + frames[frames.length - 1].byteLength;
+    for (let i = frames.length - 2; i >= 0; i--) {
+      const frame = frames[i];
+      if (frame.frameLength === 0) continue;
+      if (payloadTypes[i] !== 63) continue;
+      needLength += 4 + frame.byteLength;
+    }
+    const newData = new Uint8Array(needLength);
+    const newView = new DataView(newData.buffer);
 
-  // Construct the header.
-  frameOffset = 0;
-  for (let i = 0; i < frames.length - 1; i++) {
-    const frame = frames[i];
-    if (frame.frameLength === 0) continue;
-    if (payloadTypes[i] !== 63) continue;
-    const tsOffset = timestamps[i];
-    newView.setUint8(frameOffset, payloadTypes[i] | 0x80);
-    newView.setUint16(frameOffset + 1, (tsOffset << 2) ^ (frame.byteLength >> 8));
-    newView.setUint8(frameOffset + 3, frame.byteLength & 0xff);
-    frameOffset += 4;
-  }
-  // Last block header.
-  newView.setUint8(frameOffset++, payloadTypes[frames.length - 1]);
+    // Construct the header.
+    frameOffset = 0;
+    for (let i = 0; i < frames.length - 1; i++) {
+      const frame = frames[i];
+      if (frame.frameLength === 0) continue;
+      if (payloadTypes[i] !== 63) continue;
+      const tsOffset = timestamps[i];
+      newView.setUint8(frameOffset, payloadTypes[i] | 0x80);
+      newView.setUint16(frameOffset + 1, (tsOffset << 2) ^ (frame.byteLength >> 8));
+      newView.setUint8(frameOffset + 3, frame.byteLength & 0xff);
+      frameOffset += 4;
+    }
+    // Last block header.
+    newView.setUint8(frameOffset++, payloadTypes[frames.length - 1]);
 
-  // Construct the frame.
-  for (let i = 0; i < frames.length; i++) {
-    const frame = frames[i];
-    if (frame.frameLength === 0) continue;
-    if (payloadTypes[i] !== 63) continue;
-    newData.set(new Uint8Array(frame), frameOffset);
-    frameOffset += frame.byteLength;
+    // Construct the frame.
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
+      if (frame.frameLength === 0) continue;
+      if (payloadTypes[i] !== 63) continue;
+      newData.set(new Uint8Array(frame), frameOffset);
+      frameOffset += frame.byteLength;
+    }
+    encodedFrame.data = newData.buffer;
+  } else {
+    // Just insert the decoded Lyra.
+    console.log(frames[0]);
+    const newData = new Uint8Array(1 + frames[0].byteLength);
+    newData[0] = payloadTypes[0];
+    newData.set(frames[0], 1);
+    encodedFrame.data = newData.buffer;
   }
-  encodedFrame.data = newData.buffer;
   controller.enqueue(encodedFrame);
 }
 
